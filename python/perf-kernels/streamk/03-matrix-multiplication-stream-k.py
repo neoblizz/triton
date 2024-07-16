@@ -20,8 +20,10 @@ import random
 
 #from triton.runtime.driver import CudaUtils
 import json
+import numpy as np
 from persistent_streamk_kernel import persistent_streamk_gemm
-
+from macrotiles import mtiles
+from solution_selection import tunedtree, tunedarr, solution_params
 torch.manual_seed(123)
 random.seed(123)
 
@@ -44,7 +46,7 @@ class matmul(torch.autograd.Function):
     def _call(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, total_programs_streamk: int, BLK_M: int, BLK_N: int, BLK_K: int, gsize_m: int, two_tiles: bool, num_stages: int, num_warps: int, waves_per_eu: int,  mfmaInstrSize: int, kpack: int):
         device = a.device
 
-#        assert a.is_contiguous() and b.is_contiguous(), "non-contiguous inputs are not supported"
+        # assert a.is_contiguous() and b.is_contiguous(), "non-contiguous inputs are not supported"
         # checks constraints
         assert a.shape[1] == b.shape[0], "incompatible dimensions"
         M, K = a.shape
@@ -59,8 +61,8 @@ class matmul(torch.autograd.Function):
             # last wave may occupy less than total_programs_streamk SMs
             total_tiles_streamk = total_tiles % total_programs_streamk
             # for two-tile Stream-K + data-parallel from original paper
-#            if two_tiles and total_tiles - total_tiles_streamk > total_programs_streamk:
-#                total_tiles_streamk += total_programs_streamk
+            # if two_tiles and total_tiles - total_tiles_streamk > total_programs_streamk:
+            #   total_tiles_streamk += total_programs_streamk
             # remaining tiles are computed using classical blocking
             total_blocking_tiles = total_tiles - total_tiles_streamk
             total_iters_streamk = total_tiles_streamk * iters_per_tile
@@ -181,80 +183,209 @@ print(f"hybrid stream-k (grid={total_sm * 2}): {triton_ms:.3f} ms  {perf(triton_
 triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, C, total_tiles, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
 print(f"tile matmul (grid={total_tiles}): {triton_ms:.3f} ms  {perf(triton_ms):.3f} tflops")
 
-exit(0)
-# ---------------------------------------------------------------------------
-# Log-sampled benchmark
-# ---------------------------------------------------------------------------
+# exit(0)
 
-# tried to reproduce the tests described in the paper
-num_samples = 1000  # 32768
-step = 256
-values = ((torch.logspace(torch.tensor(step).log2(), torch.tensor(8192).log2(), num_samples, base=2) / step).round() * step).unique().tolist()
-shapes = [(int(m), int(n), int(k)) for m in values for n in values for k in values]
-shapes = random.sample(shapes, num_samples)
-assert len(shapes) == num_samples
+def macrotile_test():
+    for m in [512, 1024, 2048, 4096, 8192]:
+        for n in [512, 1024, 2048, 4096, 8192]:
+            for k in [512, 1024, 2048, 4096, 8192]:
+                sm = 304
+                gsize_m = 16
+                two_tiles = 'True'
+                num_stages = 0
+                num_warps = 8
+                waves_per_eu = 0
+                mfmaInstrSize = 16
+                kpack = 2
 
-results = []
-for idx, (m, n, k) in enumerate(shapes):
-    # print progress bar
-    if idx % 10 == 0 and idx > 0:
-        speedups = [r["speedup"] for r in results]
-        print(f"{idx}/{num_samples} - average speedup: {sum(speedups) / len(speedups):.3f}")
+                A = torch.randn(m, k, device="cuda", dtype=torch.float16)
+                B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
+                measures = list()    
+                for ii, mt in enumerate(mtiles):
+                    if ii % 10 == 0 and ii > 0:
+                        print(f"step {ii}")
+                    # print(ii, mt['mt0'], mt['mt1'], mt['depu'])
+                    output: Optional[torch.Tensor] = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                    
+                    def wrapper_matmul(*args, **kwargs):
+                        global output
+                        output = matmul.apply(*args, **kwargs)
+                        return output
+                    
+                    expected = A @ B
+                    pytorch_ms = triton.testing.do_bench(lambda: A @ B)
+                    
+                    BLK_M = mt['mt0']
+                    BLK_N = mt['mt1']
+                    BLK_K = mt['depu']
+                    total_blocks_M = triton.cdiv(m, BLK_M)
+                    total_blocks_N = triton.cdiv(n, BLK_N)
+                    total_tiles = total_blocks_M * total_blocks_N
 
-    A = torch.randn(m, k, device="cuda", dtype=torch.float16)
-    B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
-    output: Optional[torch.Tensor] = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                    triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
+                    C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                    matmul.set_debug(True)
+                    C = matmul.apply(A, B, C, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
+                    matmul.set_debug(False)
+                    max_disc = (C - expected).abs().max().item()
+                    # large tolerance to accomodate for large K (rounding due to half precision), we just want to catch bugs.
+                    assert max_disc <= 5., f"pb size: {m}x{n}x{k} - max discrepancy: {max_disc} - sm: {sm}, 2 tiles: {two_tiles}\n{output}\n{expected}"
+                    info = {
+                            "m": m,
+                            "n": n,
+                            "k": k,
+                            "MT0": BLK_M,
+                            "MT1": BLK_N,
+                            "DepU": BLK_K,
+                            "sm": sm,
+                            "total_tiles": total_tiles,
+                            "disc": max_disc,
+                            "triton_ms": triton_ms,
+                            "pytorch_ms": pytorch_ms,
+                            }
+                    measures.append(info)
+                with open(f"mtiles_{m}_{n}_{k}.json", "w") as f:
+                    json.dump(measures, f, indent=4)
 
+macrotile_test()
 
-    def wrapper_matmul(*args, **kwargs):
-        global output
-        output = matmul.apply(*args, **kwargs)
-        return output
-
-
-    expected = A @ B
-    pytorch_ms = triton.testing.do_bench(lambda: A @ B)
+def selection_test():
+    sm = 304
+    gsize_m = 16
+    two_tiles = 'True'
+    num_stages = 0
+    num_warps = 8
+    waves_per_eu = 0
+    mfmaInstrSize = 16
+    kpack = 2
     measures = list()
-    for two_tiles in [True, False]:
-        nb_sm = [total_sm, total_sm * 2]
-        total_tile = (m // BLK_M) * (n // BLK_N)
-        if total_tile < total_sm * 2:
-            nb_sm.append(total_tile)
-        nb_sm += random.sample(range(2, total_sm * 2, 2), 10)
-        for sm in nb_sm:
-            triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
-            C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
-            C = matmul.apply(A, B, C, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
-            max_disc = (C - expected).abs().max().item()
-            # large tolerance to accomodate for large K (rounding due to half precision), we just want to catch bugs.
-            assert max_disc <= 5., f"pb size: {m}x{n}x{k} - max discrepancy: {max_disc} - sm: {sm}, 2 tiles: {two_tiles}\n{output}\n{expected}"
-            info = {
-                "2 tiles": two_tiles,
-                "sm": sm,
-                "disc": max_disc,
-                "triton_ms": triton_ms,
-            }
-            measures.append(info)
-    best_triton_ms = min([m["triton_ms"] for m in measures])
-    d = {
-        "m": m,
-        "n": n,
-        "k": k,
-        "triton": measures,
-        "pytorch_ms": pytorch_ms,
-        "speedup": pytorch_ms / best_triton_ms,
-    }
-    results.append(d)
-    measures = list()
+    for m in range(128,8193,250):
+        for n in range(128,8193,250):
+            for ii,k in enumerate(range(128,8193,250)):
+                if ii % 10 == 0 and ii > 0:
+                    print(m, n, k)
+                A = torch.randn(m, k, device="cuda", dtype=torch.float16)
+                B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
 
-results.sort(key=lambda x: x["speedup"], reverse=False)
+                # print(ii, mt['mt0'], mt['mt1'], mt['depu'])
+                output: Optional[torch.Tensor] = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                
+                def wrapper_matmul(*args, **kwargs):
+                    global output
+                    output = matmul.apply(*args, **kwargs)
+                    return output
+                
+                expected = A @ B
+                pytorch_ms = triton.testing.do_bench(lambda: A @ B)
+                
+                dist, treeidx = tunedtree.query(np.array([m,n,k]).reshape(1,-1))
+                mt = solution_params[tunedarr[treeidx[0][0]]]
+                BLK_M = mt['MT0']
+                BLK_N = mt['MT1']
+                BLK_K = mt['DepthU']
+                total_blocks_M = triton.cdiv(m, BLK_M)
+                total_blocks_N = triton.cdiv(n, BLK_N)
+                total_tiles = total_blocks_M * total_blocks_N
 
-# ---------------------------------------------------------------------------
-# Benchmark export
-# ---------------------------------------------------------------------------
+                triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
+                C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                C = matmul.apply(A, B, C, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
+                max_disc = (C - expected).abs().max().item()
+                # large tolerance to accomodate for large K (rounding due to half precision), we just want to catch bugs.
+                # assert max_disc <= 5., f"pb size: {m}x{n}x{k} - max discrepancy: {max_disc} - sm: {sm}, 2 tiles: {two_tiles}\n{output}\n{expected}"
+                info = {
+                        "m": m,
+                        "n": n,
+                        "k": k,
+                        "MT0": BLK_M,
+                        "MT1": BLK_N,
+                        "DepU": BLK_K,
+                        "sm": sm,
+                        "total_tiles": total_tiles,
+                        "disc": max_disc,
+                        "triton_ms": triton_ms,
+                        "pytorch_ms": pytorch_ms,
+                        }
+                measures.append(info)
+    with open(f"benchmark.json", "w") as f:
+        json.dump(measures, f, indent=4)
 
-with open("results.json", "w") as f:
-    json.dump(results, f, indent=4)
+# selection_test()
 
-# 32760/32768 - average speedup: 0.962 (A100)
-# 990/1000 - average speedup: 1.063 (3090 RTX with while loop and 2 tiles disabled / enabled)
+def log_sampled():
+    # ---------------------------------------------------------------------------
+    # Log-sampled benchmark
+    # ---------------------------------------------------------------------------
+
+    # tried to reproduce the tests described in the paper
+    num_samples = 20  # 32768
+    step = 256
+    values = ((torch.logspace(torch.tensor(step).log2(), torch.tensor(8192).log2(), num_samples, base=2) / step).round() * step).unique().tolist()
+    shapes = [(int(m), int(n), int(k)) for m in values for n in values for k in values]
+    shapes = random.sample(shapes, num_samples)
+    assert len(shapes) == num_samples
+
+    results = []
+    for idx, (m, n, k) in enumerate(shapes):
+        # print progress bar
+        if idx % 10 == 0 and idx > 0:
+            speedups = [r["speedup"] for r in results]
+            print(f"{idx}/{num_samples} - average speedup: {sum(speedups) / len(speedups):.3f}")
+
+        A = torch.randn(m, k, device="cuda", dtype=torch.float16)
+        B = torch.randn(n, k, device="cuda", dtype=torch.float16).T
+        output: Optional[torch.Tensor] = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+
+
+        def wrapper_matmul(*args, **kwargs):
+            global output
+            output = matmul.apply(*args, **kwargs)
+            return output
+
+
+        expected = A @ B
+        pytorch_ms = triton.testing.do_bench(lambda: A @ B)
+        measures = list()
+        for two_tiles in [True, False]:
+            nb_sm = [total_sm, total_sm * 2]
+            total_tile = (m // BLK_M) * (n // BLK_N)
+            if total_tile < total_sm * 2:
+                nb_sm.append(total_tile)
+            nb_sm += random.sample(range(2, total_sm * 2, 2), 10)
+            for sm in nb_sm:
+                triton_ms = triton.testing.do_bench(lambda: matmul.apply(A, B, output, sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack))
+                C = torch.zeros((m, n), device="cuda", dtype=A.dtype)
+                C = matmul.apply(A, B, C, total_sm, BLK_M, BLK_N, BLK_K, gsize_m, two_tiles, num_stages, num_warps, waves_per_eu,  mfmaInstrSize, kpack)
+                max_disc = (C - expected).abs().max().item()
+                # large tolerance to accomodate for large K (rounding due to half precision), we just want to catch bugs.
+                assert max_disc <= 5., f"pb size: {m}x{n}x{k} - max discrepancy: {max_disc} - sm: {sm}, 2 tiles: {two_tiles}\n{output}\n{expected}"
+                info = {
+                    "2 tiles": two_tiles,
+                    "sm": sm,
+                    "disc": max_disc,
+                    "triton_ms": triton_ms,
+                }
+                measures.append(info)
+        best_triton_ms = min([m["triton_ms"] for m in measures])
+        d = {
+            "m": m,
+            "n": n,
+            "k": k,
+            "triton": measures,
+            "pytorch_ms": pytorch_ms,
+            "speedup": pytorch_ms / best_triton_ms,
+        }
+        results.append(d)
+        measures = list()
+
+    results.sort(key=lambda x: x["speedup"], reverse=False)
+
+    # ---------------------------------------------------------------------------
+    # Benchmark export
+    # ---------------------------------------------------------------------------
+
+    with open("results.json", "w") as f:
+        json.dump(results, f, indent=4)
+
+    # 32760/32768 - average speedup: 0.962 (A100)
+    # 990/1000 - average speedup: 1.063 (3090 RTX with while loop and 2 tiles disabled / enabled)
